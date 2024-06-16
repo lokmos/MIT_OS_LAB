@@ -132,3 +132,15 @@ printfinit(void)
   initlock(&pr.lock, "pr");
   pr.locking = 1;
 }
+
+// Print a backtrace of the calling CPU's stack.
+void
+backtrace(void)
+{
+  uint64 fp = r_fp();
+  while (fp != PGROUNDUP(fp)) {
+    uint64 ra = *(uint64*)(fp - 8);
+    printf("%p\n", ra);
+    fp = *(uint64*)(fp - 16);
+  }
+}
