@@ -29,6 +29,36 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
+uint
+checkCow(uint64 va) {
+  struct proc* p = myproc();
+  pte_t* pte;
+   return va < p->sz // 在进程内存范围内
+    && ((pte = walk(p->pagetable, va, 0))!=0)
+    && (*pte & PTE_V) // 页表项存在
+    && (*pte & PTE_COW); // 页是一个懒复制页
+}
+
+int
+copyOnWrite(uint64 va) {
+  pte_t *pte;
+  struct proc *p = myproc();
+  if ((pte = walk(p->pagetable, va, 0)) == 0)
+    panic("copyOnWrite: pte should exist");
+  
+  uint64 pa = PTE2PA(*pte);
+  uint64 new = (uint64)kcopy_n_deref((void *)pa);
+  if (new == 0) {
+    return -1;
+  }
+  uint64 flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 0);
+  if(mappages(p->pagetable, va, 1, new, flags) == -1) {
+    panic("copyOnWrite: mappages");
+  }
+  return 0;
+}
+
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
@@ -65,7 +95,17 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if (r_scause() == 13 || r_scause() == 15) {
+    uint64 va = r_stval();
+    if (checkCow(va)) {
+      if (copyOnWrite(va) < 0) {
+        p->killed = 1;
+      }
+    } else {
+      p->killed = 1;
+    }
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
@@ -82,6 +122,8 @@ usertrap(void)
 
   usertrapret();
 }
+
+
 
 //
 // return to user space

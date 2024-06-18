@@ -9,6 +9,12 @@
 #include "riscv.h"
 #include "defs.h"
 
+#define PA2PGREF_ID(p) (((p - KERNBASE) / PGSIZE))
+#define MAX_PA2PGREF PA2PGREF_ID(PHYSTOP)
+struct spinlock pgreflock;
+
+int pageref[MAX_PA2PGREF];
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -27,6 +33,7 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&pgreflock, "pgref");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,16 +57,24 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+  
+  acquire(&pgreflock);
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+  if(--pageref[PA2PGREF_ID((uint64)pa)] <= 0) {
+    // 当页面的引用计数小于等于 0 的时候，释放页面
 
-  r = (struct run*)pa;
+    // Fill with junk to catch dangling refs.
+    // pa will be memset multiple times if race-condition occurred.
+    memset(pa, 1, PGSIZE);
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+    r = (struct run*)pa;
+
+    acquire(&kmem.lock);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    release(&kmem.lock);
+  }
+  release(&pgreflock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -76,7 +91,34 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
+    pageref[PA2PGREF_ID((uint64)r)] = 1;
+  }
   return (void*)r;
+}
+
+void *
+kcopy_n_deref(void *pa) {
+  acquire(&pgreflock);
+  if (pageref[PA2PGREF_ID((uint64)pa)] <= 1) {
+    release(&pgreflock);
+    return pa;
+  }
+  uint64 newa = (uint64)kalloc();
+  if (newa == 0) {
+    release(&pgreflock);
+    return 0;
+  }
+  memmove((void *)newa, pa, PGSIZE);
+  pageref[PA2PGREF_ID((uint64)pa)]--;
+  release(&pgreflock);
+  return (void *)newa;
+}
+
+void
+krefpage(void *pa) {
+  acquire(&pgreflock);
+  pageref[PA2PGREF_ID((uint64)pa)]++;
+  release(&pgreflock);
 }
