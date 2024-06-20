@@ -18,15 +18,21 @@ struct run {
   struct run *next;
 };
 
-struct {
+struct kmem{
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+};
+
+struct kmem cpu_kmem[NCPU];
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  // initlock(&kmem.lock, "kmem");
+  // freerange(end, (void*)PHYSTOP);
+  for (int i = 0; i < NCPU; ++i) {
+    initlock(&cpu_kmem[i].lock, "kmem");
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -47,6 +53,9 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  push_off();
+  int cpu_id = cpuid();
+  pop_off();
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
@@ -56,10 +65,10 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  acquire(&cpu_kmem[cpu_id].lock);
+  r->next = cpu_kmem[cpu_id].freelist;
+  cpu_kmem[cpu_id].freelist = r;
+  release(&cpu_kmem[cpu_id].lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -68,14 +77,43 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
+  // struct run *r;
+
+  // acquire(&kmem.lock);
+  // r = kmem.freelist;
+  // if(r)
+  //   kmem.freelist = r->next;
+  // release(&kmem.lock);
+
+  // if(r)
+  //   memset((char*)r, 5, PGSIZE); // fill with junk
+  // return (void*)r;
+
   struct run *r;
+  push_off();
+  int cpu_id = cpuid();
+  pop_off();
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
-
+  acquire(&cpu_kmem[cpu_id].lock);
+  r = cpu_kmem[cpu_id].freelist;
+  if(r) {
+    cpu_kmem[cpu_id].freelist = r->next;
+  }
+  else {
+    for (int id = 0; id < NCPU; ++id) {
+      if (id == cpu_id)
+        continue;
+      acquire(&cpu_kmem[id].lock);
+      r = cpu_kmem[id].freelist;
+      if (r) {
+        cpu_kmem[id].freelist = r->next;
+        release(&cpu_kmem[id].lock);
+        break;
+      }
+      release(&cpu_kmem[id].lock);
+    }
+  }
+  release(&cpu_kmem[cpu_id].lock);
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
