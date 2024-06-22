@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -483,4 +484,136 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+struct vma *find(uint64 va, struct proc *p){
+  struct vma *vv;
+  for (vv = p->vmas; vv < &p->vmas[NVMA]; vv++){
+    if(vv->valid && va >= vv->addr && va < vv->addr + vv->len){
+      return vv;
+    }
+  }
+  return 0;
+}
+
+int handleVma(uint64 va, struct proc *p) {
+  struct vma *vv;
+  vv = find(va, p);
+  if(vv == 0){
+    return 0;
+  }
+
+   // allocate physical page
+  void *pa = kalloc();
+  if(pa == 0) {
+    panic("handleVma: kalloc");
+  }
+  memset(pa, 0, PGSIZE);
+  
+  // read data from disk
+  begin_op();
+  ilock(vv->f->ip);
+  readi(vv->f->ip, 0, (uint64)pa, vv->offset + PGROUNDDOWN(va - vv->addr), PGSIZE);
+  iunlock(vv->f->ip);
+  end_op();
+
+  // set appropriate perms, then map it.
+  int perm = PTE_U;
+  if(vv->prot & PROT_READ)
+    perm |= PTE_R;
+  if(vv->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(vv->prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W | PTE_U) < 0) {
+    panic("handleVma: mappages");
+  }
+
+  return 1;
+}
+
+uint64
+sys_mmap(void) {
+  uint64 addr;
+  uint64 len;
+  int prot;
+  int flags;
+  int fd;
+  uint64 offset;
+  struct file *f;
+  uint64 vend = MMAPEND;
+
+  if (argaddr(0, &addr) < 0 || argaddr(1, &len) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 || argaddr(5, &offset) < 0) {
+    return -1;
+  }
+  if (addr != 0 || offset != 0)
+    return -1;
+  if((!f->readable && (prot & (PROT_READ)))
+     || (!f->writable && (prot & PROT_WRITE) && !(flags & MAP_PRIVATE)))
+    return -1;
+
+  for (int i = 0; i < NVMA; i++) {
+    if (myproc()->vmas[i].valid == 0) {
+      myproc()->vmas[i].addr = vend - len;
+      myproc()->vmas[i].len = len;
+      myproc()->vmas[i].prot = prot;
+      myproc()->vmas[i].flags = flags;
+      myproc()->vmas[i].fd = fd;
+      myproc()->vmas[i].offset = offset;
+      myproc()->vmas[i].valid = 1;
+      myproc()->vmas[i].f = f;
+      filedup(f);
+      myproc()->sz += len;
+      return vend - len;
+    }
+    else 
+      vend = PGROUNDDOWN(myproc()->vmas[i].addr);
+  }
+  return -1;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, sz;
+
+  if(argaddr(0, &addr) < 0 || argaddr(1, &sz) < 0 || sz == 0)
+    return -1;
+
+  struct proc *p = myproc();
+
+  struct vma *v = find(addr, p);
+  if(v == 0) {
+    return -1;
+  }
+
+  if(addr > v->addr && addr + sz < v->addr + v->len) {
+    // trying to "dig a hole" inside the memory range.
+    return -1;
+  }
+
+  uint64 addr_aligned = addr;
+  if(addr > v->addr) {
+    addr_aligned = PGROUNDUP(addr);
+  }
+
+  int nunmap = sz - (addr_aligned-addr); // nbytes to unmap
+  if(nunmap < 0)
+    nunmap = 0;
+  
+  vmaunmap(p->pagetable, addr_aligned, nunmap, v); // custom memory page unmap routine for mmapped pages.
+
+  if(addr <= v->addr && addr + sz > v->addr) { // unmap at the beginning
+    v->offset += addr + sz - v->addr;
+    v->addr = addr + sz;
+  }
+  v->len -= sz;
+
+  if(v->len <= 0) {
+    fileclose(v->f);
+    v->valid = 0;
+  }
+
+  return 0;  
 }
